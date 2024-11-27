@@ -454,6 +454,203 @@ class substrate_contacts(Potential):
             self.motif_frame = xyz[rand_idx[0],:4]
             self.motif_mapping = [(rand_idx, i) for i in range(4)]
 
+class updated_custom_obj_repulsive(Potential):
+    def __init__(self, surface_obj, scale, weight=1, r_0=8, d_0=2, n=6, m=12, eps=1e-6, unconditional=False):
+        self.r_0 = r_0
+        self.weight = weight
+        self.d_0 = d_0
+        self.eps = eps
+        self.unc = unconditional
+        self.scale = scale
+        self.n = n
+        self.m = m
+        
+        # Add new parameters while keeping original functionality
+        self.sinkhorn_iterations = 10
+        self.sinkhorn_scale = 1.0
+        
+        if self.unc:
+            print('Warning: running as unconditional !!!')
+        
+        self.vertices, self.normals, self.faces = self.get_surface_from_obj(surface_obj)
+        self.save_obj_to_file(f"{surface_obj.replace('.obj','')}_{int(scale)}.pdb")
+    
+    def save_obj_to_file(self, filename):
+        with open(filename, 'w') as f:
+            for i, coord in enumerate(self.vertices):
+                x, y, z = coord
+                atom_line = (f"ATOM  {i+1:5d}  H   UNK A{i+1:4d}    "
+                            f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           H  \n")
+                f.write(atom_line)
+            f.write("END\n")
+        print(f"Saved centered positions to {filename}")
+    
+    def _center(self, X):
+        return X - X.mean(dim=0, keepdim=True)
+    
+    def _rg(self, X):
+        X = self._center(X)
+        rsq = X.square().sum(1, keepdim=True)
+        rg = rsq.mean(0, keepdim=True).sqrt()
+        return rg
+    
+    def _optimize_sinkhorn(self, cost):
+        """
+        Implement Sinkhorn algorithm for optimal transport
+        cost: [num_Ca, num_vertices]
+        Returns: [num_Ca, num_vertices]
+        """
+        B = torch.exp(-cost / self.sinkhorn_scale)
+        for _ in range(self.sinkhorn_iterations):
+            B = B / B.sum(dim=-1, keepdim=True)  # normalize rows
+            B = B / B.sum(dim=-2, keepdim=True)  # normalize columns
+        return B
+    
+    def _distance(self, X_i, X_j):
+        dX = X_i.unsqueeze(2) - X_j.unsqueeze(1)
+        D = torch.sqrt((dX**2).sum(-1) + self.eps)
+        return D
+    
+    def get_surface_from_obj(self, surface_obj):
+        vertices = []
+        faces = []
+        
+        with open(surface_obj, 'r') as f:
+            for line in f:
+                if line.startswith('v '):
+                    v = list(map(float, line.split()[1:4]))
+                    vertices.append(v)
+                elif line.startswith('f '):
+                    f = [int(v.split('/')[0]) for v in line.split()[1:4]]
+                    faces.append(f)
+        
+        vertices = np.array(vertices)
+        
+        faces = np.array(faces) - 1  # OBJ indices start at 1, so we subtract 1
+        
+        # Calculate the center of mass
+        com = np.mean(vertices, axis=0)
+        print(f"Center of mass before centering: {com}")
+        
+        # Center the vertices
+        vertices_centered = self._center(torch.tensor(vertices, dtype=torch.float32))
+        
+        # Convert to torch tensors
+        device = torch.device('cpu')
+        self.vertices = vertices_centered * self.scale
+        self.faces = torch.tensor(faces, dtype=torch.long, device=device)
+        
+        # Calculate face normals
+        self.face_normals = self.calculate_face_normals()
+        
+        return self.vertices, self.face_normals, self.faces
+    
+    def calculate_face_normals(self):
+        v0 = self.vertices[self.faces[:, 0]]
+        v1 = self.vertices[self.faces[:, 1]]
+        v2 = self.vertices[self.faces[:, 2]]
+        
+        face_normals = torch.cross(v1 - v0, v2 - v0)
+        face_normals = face_normals / face_normals.norm(dim=1, keepdim=True)
+        
+        return face_normals
+    
+    def is_inside_mesh(self, points):
+        # Ray casting algorithm
+        directions = torch.tensor([1.0, 0.0, 0.0], device=points.device).unsqueeze(0).repeat(points.shape[0], 1)
+        
+        intersections = torch.zeros(points.shape[0], dtype=torch.long, device=points.device)
+        
+        for i, face in enumerate(self.faces):
+            v0, v1, v2 = self.vertices[face]
+            n = self.face_normals[i]  # Use face normal
+            
+            # Check if ray intersects with triangle
+            edge1 = v1 - v0
+            edge2 = v2 - v0
+            
+            # Ensure all tensors are 2D for broadcasting
+            edge1 = edge1.unsqueeze(0).expand(points.shape[0], -1)
+            edge2 = edge2.unsqueeze(0).expand(points.shape[0], -1)
+            v0 = v0.unsqueeze(0).expand(points.shape[0], -1)
+            
+            h = torch.cross(directions, edge2, dim=1)
+            a = torch.sum(edge1 * h, dim=1)
+            
+            mask = torch.abs(a) > 1e-6
+            
+            t = points - v0
+            u = torch.sum(t * h, dim=1) / a
+            q = torch.cross(t, edge1, dim=1)
+            v = torch.sum(directions * q, dim=1) / a
+            
+            t = torch.sum(edge2 * q, dim=1) / a
+            
+            intersect_mask = (u >= 0) & (u <= 1) & (v >= 0) & (u + v <= 1) & (t > 0) & mask
+            intersections += intersect_mask.long()
+        
+        return (intersections % 2 == 1).bool()
+    
+    def compute(self, xyz):
+        Ca = xyz[:, 1]  # [L,3]
+        
+        # Center both point clouds
+        Ca = self._center(Ca)
+        vertices = self._center(self.vertices)
+        
+        # Calculate distances between Ca atoms and surface vertices
+        distances = self._distance(Ca, vertices)  # [num_Ca, num_vertices]
+        
+        # Compute optimal transport
+        T_w = self._optimize_sinkhorn(distances)  # [num_Ca, num_vertices]
+        weighted_distances = (T_w * distances).sum(dim=1)  # [num_Ca]
+        
+        # Determine if Ca atoms are inside or outside the mesh
+        is_inside = self.is_inside_mesh(Ca)  # [num_Ca]
+        
+        # Calculate potential
+        potential = torch.zeros_like(weighted_distances)  # [num_Ca]
+        
+        # Apply repulsive potential when distance is more than d_0 and atom is outside the mesh
+        mask = (weighted_distances > self.d_0) & ~is_inside  # [num_Ca]
+        
+        # # Use softplus for smoother gradients
+        # if mask.any():
+        #     potential[mask] = self.weight * (
+        #         (weighted_distances[mask] / (self.d_0 + self.eps)) ** self.r_0 - 1
+        #     )
+        
+        # # Apply attractive potential for atoms outside the mesh
+        # if (~is_inside).any():
+        #     potential[~is_inside] = -self.weight * weighted_distances[~is_inside]
+        
+        # if (~is_inside).any():
+        #     poop = ( weighted_distances[~is_inside] - self.d_0 ) / self.r_0
+        #     potential[~is_inside] = - self.weight * ( 1 - poop**self.n ) / ( 1- poop**self.m)
+        
+        # if (~is_inside).any():
+        potential[is_inside] = - 1e-3 * self.weight * weighted_distances[is_inside]
+        potential[~is_inside] = - self.weight * weighted_distances[~is_inside]
+        
+        if self.unc:
+            potential[mask] = 0.
+        
+        print(f"repulsion ratio: {mask.sum().item() / len(mask):.2f}")
+        print(f"atoms inside mesh: {is_inside.sum().item() / len(is_inside):.2f}")
+        
+        return potential.sum()
+    
+    def _distance(self, X_i, X_j):
+        """
+        Compute pairwise distances between two sets of points
+        X_i: [N, 3]
+        X_j: [M, 3]
+        Returns: [N, M]
+        """
+        dX = X_i.unsqueeze(1) - X_j.unsqueeze(0)  # [N, M, 3]
+        D = torch.sqrt((dX**2).sum(-1) + self.eps)  # [N, M]
+        return D
+
 # Dictionary of types of potentials indexed by name of potential. Used by PotentialManager.
 # If you implement a new potential you must add it to this dictionary for it to be used by
 # the PotentialManager
@@ -464,7 +661,9 @@ implemented_potentials = { 'monomer_ROG':          monomer_ROG,
                            'interface_ncontacts':  interface_ncontacts,
                            'monomer_contacts':     monomer_contacts,
                            'olig_contacts':        olig_contacts,
-                           'substrate_contacts':    substrate_contacts}
+                           'substrate_contacts':    substrate_contacts,
+                           'updated_custom_obj_repulsive': updated_custom_obj_repulsive,
+                           }
 
 require_binderlen      = { 'binder_ROG',
                            'binder_distance_ReLU',
