@@ -502,7 +502,10 @@ class Denoise:
 
 
 def sampler_selector(conf: DictConfig):
-    if conf.scaffoldguided.scaffoldguided:
+    if conf.inference.model_runner == "OneShotSampler":
+        sampler = model_runners.OneShotSampler(conf)
+        conf.inference.output_prefix = f"./{conf.inference.input_pdb.split('/')[-1].replace('.pdb','_oneshot')}"
+    elif conf.scaffoldguided.scaffoldguided:
         sampler = model_runners.ScaffoldedSampler(conf)
     else:
         if conf.inference.model_runner == "default":
