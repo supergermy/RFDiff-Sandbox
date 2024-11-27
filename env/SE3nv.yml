@@ -1,4 +1,4 @@
-name: SE3nv
+name: PX-SE3nv
 channels:
   - defaults
   - conda-forge
