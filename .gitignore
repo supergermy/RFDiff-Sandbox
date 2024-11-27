@@ -16,3 +16,4 @@ tests/tim_barrel_scaffold
 tests/tests_*
 env/SE3nv.yml
 **/outputs/
+examples/
