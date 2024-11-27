@@ -14,3 +14,8 @@ tests/reference_outputs/
 tests/target_folds
 tests/tim_barrel_scaffold
 tests/tests_*
+env/SE3nv.yml
+outputs/2024-11-27/14-38-34/server_mode_inference.log
+outputs/2024-11-27/14-38-34/.hydra/config.yaml
+outputs/2024-11-27/14-38-34/.hydra/hydra.yaml
+outputs/2024-11-27/14-38-34/.hydra/overrides.yaml
