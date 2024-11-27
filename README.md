@@ -438,6 +438,25 @@ We have already implemented several potentials but it is relatively straightforw
 
 ---
 
+### Oneshot refinement (server mode)
+We can use a special case of partial diffusion to refine small defects in a pdb file. When a polypeptide structure is created by PX VR, it is highly likely to contain several chain breaks and unsatisfied hydrogen bonds between backbone atoms. We tend to somehow _"refine"_ the structure using a RFDiffusion single step. blablabla
+
+Here's an example of how to use an oneshot:
+```
+./scripts/server_mode_inference.py
+```
+```
+Enter new input PDB path (or 'exit' to quit):
+../examples/input_pdbs/2024_0612_1116_41_SKETCH.pdb
+2024-11-27 13:27:58,132][__main__][INFO] - Processing new input PDB: ../examples/input_pdbs/2024_0612_1116_41_SKETCH.pdb
+[2024-11-27 13:27:58,135][__main__][INFO] - Making design /home/annung202/ProteinSketch/RFdiffusion_sandbox/scripts/2024_0612_1116_41_SKETCH_fixed.pdb
+[2024-11-27 13:27:58,163][rfdiffusion.inference.model_runners][INFO] - Using contig: ['71-71']
+With this beta schedule (linear schedule, beta_0 = 0.04, beta_T = 0.28), alpha_bar_T = 0.00013696048699785024
+[2024-11-27 13:27:58,191][rfdiffusion.inference.model_runners][INFO] - Sequence init: -----------------------------------------------------------------------
+[2024-11-27 13:28:02,496][__main__][INFO] - Finished design in 0.07 minutes
+```
+---
+
 ### Symmetric Motif Scaffolding.  
 We can also combine symmetric diffusion with motif scaffolding to scaffold motifs symmetrically.
 Currently, we have one way for performing symmetric motif scaffolding. That is by specifying the position of the motif specified w.r.t. the symmetry axes.  
