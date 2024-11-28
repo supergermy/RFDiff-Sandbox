@@ -502,9 +502,7 @@ class Denoise:
 
 
 def sampler_selector(conf: DictConfig):
-    print('@')
     if conf.inference.model_runner == "OneShotSampler":
-        print('@@')
         sampler = model_runners.OneShotSampler(conf)
         conf.inference.output_prefix = f"./{conf.inference.input_pdb.split('/')[-1].replace('.pdb','_oneshot')}"
     elif conf.scaffoldguided.scaffoldguided:
