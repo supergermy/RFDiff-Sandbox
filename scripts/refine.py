@@ -16,7 +16,7 @@ See https://hydra.cc/docs/advanced/hydra-command-line-flags/ for more options.
 """
 
 import re
-import os, time, pickle, sys
+import os, time, pickle, sys, time
 import torch
 from omegaconf import OmegaConf
 import hydra
@@ -44,6 +44,7 @@ def make_deterministic(seed=0):
 
 @hydra.main(version_base=None, config_path="../config/inference", config_name="oneshot")
 def main(conf: HydraConfig) -> None:
+    start_time = time.time()
     log = logging.getLogger(__name__)
     if conf.inference.deterministic:
         make_deterministic()
@@ -132,6 +133,8 @@ def main(conf: HydraConfig) -> None:
 
             xyz_to_pdb(px0, sampler.inf_conf.output_pdb)
             sampler.inf_conf.input_pdb = sampler.inf_conf.output_pdb
+    end_time = time.time()
+    print(f'time: {end_time - start_time}')
 
 
 if __name__ == "__main__":
