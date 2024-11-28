@@ -16,7 +16,7 @@ See https://hydra.cc/docs/advanced/hydra-command-line-flags/ for more options.
 """
 
 import re
-import os, time, pickle
+import os, time, pickle, sys
 import torch
 from omegaconf import OmegaConf
 import hydra
@@ -27,6 +27,7 @@ from hydra.core.hydra_config import HydraConfig
 import numpy as np
 import random
 import glob
+
 
 def xyz_to_pdb(coords, output_pdb):
     with open(output_pdb, 'w') as f:
@@ -41,7 +42,7 @@ def make_deterministic(seed=0):
     np.random.seed(seed)
     random.seed(seed)
 
-@hydra.main(version_base=None, config_path="../config/inference", config_name="base")
+@hydra.main(version_base=None, config_path="../config/inference", config_name="oneshot")
 def main(conf: HydraConfig) -> None:
     log = logging.getLogger(__name__)
     if conf.inference.deterministic:

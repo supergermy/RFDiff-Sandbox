@@ -1013,7 +1013,7 @@ class OneShotSampler(Sampler):
         ####################
         ### Forward Pass ###
         ####################
-        
+    
         with torch.no_grad():
             msa_prev, pair_prev, px0, state_prev, alpha, logits, plddt = self.model(msa_masked,
                                 msa_full,
