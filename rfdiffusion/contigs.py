@@ -1,7 +1,7 @@
 import sys
 import numpy as np
 import random
-import .RecommendN from RecommendN
+from .RecommendN import RecommendN
 
 
 class ContigMap:
