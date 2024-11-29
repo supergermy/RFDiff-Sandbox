@@ -273,7 +273,8 @@ class Sampler:
         ################################
 
         if self.inf_conf.model_runner == 'OneShotSampler':
-            self.contig_conf.contigs = [f"{self.target_feats['pdb_idx'][-1][1]}-{self.target_feats['pdb_idx'][-1][1]}"]
+            self.contig_conf.contigs = [f"{self.target_feats['pdb_idx'][-1][1]-self.target_feats['pdb_idx'][0][1]+1}-{self.target_feats['pdb_idx'][-1][1]-self.target_feats['pdb_idx'][0][1]+1}"]
+            #self.contig_conf.contigs = ["35-35"]
         
         # Generate a specific contig from the range of possibilities specified at input
 

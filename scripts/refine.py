@@ -42,7 +42,7 @@ def make_deterministic(seed=0):
     np.random.seed(seed)
     random.seed(seed)
 
-@hydra.main(version_base=None, config_path="../config/inference", config_name="oneshot")
+@hydra.main(version_base=None, config_path="../config/inference", config_name="base")
 def main(conf: HydraConfig) -> None:
     start_time = time.time()
     log = logging.getLogger(__name__)
@@ -93,6 +93,7 @@ def main(conf: HydraConfig) -> None:
                 continue
 
             x_init, seq_init = sampler.sample_init()
+            #sampler.contig_map.contigs = [34-34]
 
             x_t = torch.clone(x_init)
             seq_t = torch.clone(seq_init)
