@@ -31,6 +31,7 @@ contigmap:
   inpaint_str_loop: null
   provide_seq: null
   length: null
+  provide_vol: null
 
 model:
   n_extra_block: 4
