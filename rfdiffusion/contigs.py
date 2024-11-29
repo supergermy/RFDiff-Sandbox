@@ -1,6 +1,7 @@
 import sys
 import numpy as np
 import random
+import .RecommendN from RecommendN
 
 
 class ContigMap:
@@ -27,10 +28,29 @@ class ContigMap:
         inpaint_str_tensor=None,
         topo=False,
         provide_seq=None,
+        provide_vol=None,
         inpaint_str_strand=None,
         inpaint_str_helix=None,
         inpaint_str_loop=None
     ):
+
+
+        # provide_volume
+        if provide_vol:
+
+            vol_dict = {entry.split(':')[0]:entry.split(':')[1] for entry in provide_vol[0].split(',')}
+
+            voxel_file = vol_dict['voxel_path']
+            unit = float(vol_dict['unit'])
+
+            recommend = RecommendN(voxel_file,unit)
+            result = recommend.forward()
+            min_range = int(result[0])
+            max_range = int(result[1])
+            contigs = [f"{min_range}-{max_range}"]
+            print('Recommended sequence range:', contigs)
+
+
         # sanity checks
         if contigs is None and ref_idx is None:
             sys.exit("Must either specify a contig string or precise mapping")
