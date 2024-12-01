@@ -456,6 +456,7 @@ With this beta schedule (linear schedule, beta_0 = 0.04, beta_T = 0.28), alpha_b
 [2024-11-27 13:28:02,496][__main__][INFO] - Finished design in 0.07 minutes
 ```
 ---
+### Sequence Length Autoscaling
 
 ### Symmetric Motif Scaffolding.  
 We can also combine symmetric diffusion with motif scaffolding to scaffold motifs symmetrically.
