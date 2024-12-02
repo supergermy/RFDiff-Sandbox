@@ -458,6 +458,22 @@ With this beta schedule (linear schedule, beta_0 = 0.04, beta_T = 0.28), alpha_b
 ---
 ### Sequence Length Autoscaling
 
+If a volume condition is given, an appropriate sequence range should be determined to fit the specified volume. If the sequence is too long, it may exceed the volume even when a potential is applied. Conversely, if the sequence is too short, it may fail to fill the volume to the extent desired by the user. Therefore, we have implemented a function to “auto-scale” the sequence range, using the ‘provide_vol’ flag to ensure it fits the given volume effectively.
+
+Here's an example of how to use:
+```
+./scripts/run_inference.py inference.output_prefix=test_outputs/test ‘contigmap.provide_vol=[“voxel_path:../data/Longxing_voxel_dataset/7N1J_2.voxel,unit:2”]’ inference.num_designs=10 ‘potentials.guiding_potentials=["type:updated_custom_obj_repulsive,scale:1,weight:5,surface_obj:../data/Longxing_voxel_dataset/7N1J_2.obj”]’ potentials.guide_decay="cubic"
+```
+
+‘Unit’ refers to the resolution of the voxel.
+
+```
+[2024-11-29 17:59:44,095][rfdiffusion.inference-model_runners][INFO] - Using contig: None
+Recommended sequence range: ['92-101']
+```
+
+---
+
 ### Symmetric Motif Scaffolding.  
 We can also combine symmetric diffusion with motif scaffolding to scaffold motifs symmetrically.
 Currently, we have one way for performing symmetric motif scaffolding. That is by specifying the position of the motif specified w.r.t. the symmetry axes.  
