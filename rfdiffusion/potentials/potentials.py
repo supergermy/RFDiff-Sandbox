@@ -1,6 +1,9 @@
+import itertools
 import torch
-import numpy as np 
+import numpy as np
 from rfdiffusion.util import generate_Cbeta
+from scipy.sparse.csgraph import shortest_path
+import json
 
 class Potential:
     '''
@@ -651,6 +654,185 @@ class updated_custom_obj_repulsive(Potential):
         D = torch.sqrt((dX**2).sum(-1) + self.eps)  # [N, M]
         return D
 
+
+class shape_potential(Potential):
+    def __init__(self, voxel_path, binderlen, threshold=0, step=1, weight=1):
+        self.device="cuda" if torch.cuda.is_available() else "cpu"
+        self.weight = weight
+        
+        voxel_data = self._voxel2tensor(voxel_path, int(step))
+        self.voxel_xyz = voxel_data[:,:3]
+        self.voxel_sdf = voxel_data[:,-1]
+        self.target_xyz = self.voxel_xyz[ self.voxel_sdf<threshold ]
+        print(binderlen)
+        self._map_gw_coupling_ideal_glob(self.target_xyz, binderlen)
+    
+    def _distance(self, X_i, X_j):
+        dX = X_i.unsqueeze(2) - X_j.unsqueeze(1)
+        D = torch.sqrt((dX**2).sum(-1) + 1e-6)
+        return D
+    
+    def _distance_knn(self, X, top_k=12, max_scale=10.0):
+        """Topology distance."""
+        X_np = X.cpu().data.numpy()
+        D = np.sqrt(
+            ((X_np[:, :, np.newaxis, :] - X_np[:, np.newaxis, :, :]) ** 2).sum(-1)
+        )
+        
+        # Distance cutoff
+        D_cutoff = np.mean(np.sort(D[0, :, :], axis=-1)[:, top_k])
+        D[D > D_cutoff] = max_scale * np.max(D)
+        D = shortest_path(D[0, :, :])[np.newaxis, :, :]
+        D = torch.Tensor(D).float().to(X.device)
+        return D
+    
+    def _center(self, _X):
+        _X = _X - _X.mean(1, keepdim=True)
+        return _X
+        
+    def _voxel2tensor(self, voxel_path, step):
+        with open(voxel_path, "r") as f:
+            data = json.load(f)
+            
+        grid_size = data["gridSize"]
+        voxel_size = data["voxelSize"]
+        voxel_origin = data["origin"]
+        sdf_values = data["sdfValues"]
+        
+        points_list = []  # Use a NumPy array for efficiency
+        value_index = 0
+        for i in range(0,grid_size,step):
+            for j in range(0,grid_size,step):
+                for k in range(0,grid_size,step):
+                    value_index = (i*grid_size**2)+(j*grid_size)+(k)
+                    sdf_value = sdf_values[value_index]
+                    
+                    x = voxel_origin["x"] + i * voxel_size
+                    y = voxel_origin["y"] + j * voxel_size
+                    z = voxel_origin["z"] + k * voxel_size
+                    
+                    points_list.append([x, y, -z, sdf_value])
+                
+        # Convert the list to a NumPy array and then to a tensor
+        points_array = np.array(points_list, dtype=np.float32)
+        points_tensor = torch.from_numpy(points_array)
+        
+        return points_tensor
+    
+    @torch.no_grad()
+    def _map_gw_coupling_ideal_glob(self, X_target, num_residues):
+        """Plan a layout using Gromov-Wasserstein Optimal transport"""
+        
+        X_target = torch.Tensor(X_target).float().unsqueeze(0)
+        X_target = X_target
+        
+        chain_ix = torch.arange(num_residues, device=X_target.device) / 4.0
+        distance_1D = (chain_ix[None, :, None] - chain_ix[None, None, :]).abs()
+        # Scaling fit log-log to large scale single chain 6HYP
+        D_model = 7.21 * distance_1D**0.322
+        D_model = D_model / D_model.mean([1, 2], keepdims=True)
+        
+        D_target = self._distance_knn(X_target)
+        D_target = D_target / D_target.mean([1, 2], keepdims=True)
+        
+        T_gw, D_gw = self._optimize_couplings_gw(
+            D_model,
+            D_target,
+            scale=200,
+            iterations_outer=30,
+            iterations_inner=10,
+        )
+        self.T_gw = T_gw.detach().cpu()
+        
+        return
+    
+    def _optimize_couplings_sinkhorn(self, C, scale=1.0, iterations=10):
+        """Solve entropy regularized optimized transport via Sinkhorn iteration.
+        
+        This method uses the log-domain for numerical stability.
+        
+        Args:
+            C (Tensor): Batch of cost matrices with with shape `(B, I, J)`.
+            scale (float, optional): Entropy regularization parameter for
+                rescaling the cost matrix.
+            iterations (int, optional): Number of Sinkhorn iterations.
+            
+        Returns:
+            T (Tensor): Couplings map with shape `(B, I, J)`.
+        """
+        log_T = -C * scale
+        
+        # Initialize normalizers
+        B, I, J = log_T.shape
+        log_u = torch.zeros((B, I), device=log_T.device)
+        log_v = torch.zeros((B, J), device=log_T.device)
+        log_a = log_u - np.log(I)
+        log_b = log_v - np.log(J)
+        
+        # Iterate normalizers
+        for _ in range(iterations):
+            log_u = log_a - torch.logsumexp(log_T + log_v.unsqueeze(1), 2)
+            log_v = log_b - torch.logsumexp(log_T + log_u.unsqueeze(2), 1)
+        log_T = log_T + log_v.unsqueeze(1) + log_u.unsqueeze(2)
+        T = torch.exp(log_T)
+        return T
+    
+    def _optimize_couplings_gw(self, D_a, D_b, scale=200.0, iterations_outer=30, iterations_inner=10,):
+        """Gromov-Wasserstein Optimal Transport.
+        https://arxiv.org/pdf/1905.07645.pdf
+        
+        Args:
+            D_a (Tensor): Distance matrix describing objects in set `a` with shape `(B, I, I)`.
+            D_b (Tensor): Distance matrix describing objects in set `b` with shape `(B, J, J)`.
+            scale (float, optional): Entropy regularization parameter for
+                rescaling the cost matrix.
+            iterations_outer (int, optional): Number of outer GW iterations.
+            iterations_inner (int, optional): Number of inner Sinkhorn iterations.
+            
+        Returns:
+            T (Tensor): Couplings map with shape `(B, I, J)`.
+            
+        """
+        
+        # Gromov-Wasserstein Distance
+        N_a = D_a.shape[1]
+        N_b = D_b.shape[1]
+        p_a = torch.ones_like(D_a[:, :, 0]) / N_a
+        p_b = torch.ones_like(D_b[:, :, 0]) / N_b
+        C_ab = (
+            torch.einsum("bij,bj->bi", D_a ** 2, p_a)[:, :, None]
+            + torch.einsum("bij,bj->bi", D_b ** 2, p_b)[:, None, :]
+        )
+        T_gw = torch.einsum("bi,bj->bij", p_a, p_b)
+        for _ in range(iterations_outer):
+            cost = C_ab - 2.0 * torch.einsum("bik,bkl,blj->bij", D_a, T_gw, D_b)
+            T_gw = self._optimize_couplings_sinkhorn(cost, scale, iterations=iterations_inner)
+            
+        # Compute cost
+        cost = C_ab - 2.0 * torch.einsum("bik,bkl,blj->bij", D_a, T_gw, D_b)
+        D_gw = (T_gw * cost).sum([-1, -2]).abs().sqrt()
+        return T_gw, D_gw
+    
+    def compute(self, xyz):
+        # Extract C-alpha atom coordinates
+        Ca = xyz[None, :, 1]  # [1,L,3]
+        target_xyz = self.target_xyz[None,...] # [1,N,3]
+        
+        Ca = self._center(Ca)
+        target_xyz = self._center(target_xyz)
+        
+        D_inter = self._distance(Ca, target_xyz)
+        # Compute optimal transport using Sinkhorn's algorithm
+        T_w = self._optimize_couplings_sinkhorn(D_inter)
+        T_w = T_w + self.T_gw
+        T_w = T_w / T_w.sum([-1, -2], keepdims=True)
+        D_w = (T_w * D_inter).sum([-1, -2])
+        out = -self.weight * D_w.sum()
+        print(out)
+        
+        return out 
+
+
 # Dictionary of types of potentials indexed by name of potential. Used by PotentialManager.
 # If you implement a new potential you must add it to this dictionary for it to be used by
 # the PotentialManager
@@ -663,6 +845,7 @@ implemented_potentials = { 'monomer_ROG':          monomer_ROG,
                            'olig_contacts':        olig_contacts,
                            'substrate_contacts':    substrate_contacts,
                            'updated_custom_obj_repulsive': updated_custom_obj_repulsive,
+                           'shape_potential':      shape_potential,
                            }
 
 require_binderlen      = { 'binder_ROG',
@@ -670,5 +853,7 @@ require_binderlen      = { 'binder_ROG',
                            'binder_any_ReLU',
                            'dimer_ROG',
                            'binder_ncontacts',
-                           'interface_ncontacts'}
+                           'interface_ncontacts',
+                           'shape_potential',
+                           }
 
