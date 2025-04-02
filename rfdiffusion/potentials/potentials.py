@@ -1,9 +1,11 @@
-import itertools
 import torch
-import numpy as np
+import numpy as np 
 from rfdiffusion.util import generate_Cbeta
 from scipy.sparse.csgraph import shortest_path
 import json
+import itertools
+from tqdm import tqdm
+from rfdiffusion.inference import utils as iu
 
 class Potential:
     '''
@@ -68,6 +70,8 @@ class binder_ROG(Potential):
         Ca = xyz[:self.binderlen,1] # [Lb,3]
 
         centroid = torch.mean(Ca, dim=0, keepdim=True) # [1,3]
+        # centroid += torch.tensor([[105.42, 120.42, 16.95]]) # this should keep moving the centroid to the direction
+        # centroid = torch.tensor([[105.42, 120.42, 16.95]]) # directly moving the centroid
 
         # cdist needs a batch dimension - NRB
         dgram = torch.cdist(Ca[None,...].contiguous(), centroid[None,...].contiguous(), p=2) # [1,Lb,1,3]
@@ -457,381 +461,453 @@ class substrate_contacts(Potential):
             self.motif_frame = xyz[rand_idx[0],:4]
             self.motif_mapping = [(rand_idx, i) for i in range(4)]
 
-class updated_custom_obj_repulsive(Potential):
-    def __init__(self, surface_obj, scale, weight=1, r_0=8, d_0=2, n=6, m=12, eps=1e-6, unconditional=False):
-        self.r_0 = r_0
-        self.weight = weight
-        self.d_0 = d_0
-        self.eps = eps
-        self.unc = unconditional
-        self.scale = scale
-        self.n = n
-        self.m = m
-        
-        # Add new parameters while keeping original functionality
-        self.sinkhorn_iterations = 10
-        self.sinkhorn_scale = 1.0
-        
-        if self.unc:
-            print('Warning: running as unconditional !!!')
-        
-        self.vertices, self.normals, self.faces = self.get_surface_from_obj(surface_obj)
-        self.save_obj_to_file(f"{surface_obj.replace('.obj','')}_{int(scale)}.pdb")
-    
-    def save_obj_to_file(self, filename):
-        with open(filename, 'w') as f:
-            for i, coord in enumerate(self.vertices):
-                x, y, z = coord
-                atom_line = (f"ATOM  {i+1:5d}  H   UNK A{i+1:4d}    "
-                            f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           H  \n")
-                f.write(atom_line)
-            f.write("END\n")
-        print(f"Saved centered positions to {filename}")
-    
-    def _center(self, X):
-        return X - X.mean(dim=0, keepdim=True)
-    
-    def _rg(self, X):
-        X = self._center(X)
-        rsq = X.square().sum(1, keepdim=True)
-        rg = rsq.mean(0, keepdim=True).sqrt()
-        return rg
-    
-    def _optimize_sinkhorn(self, cost):
-        """
-        Implement Sinkhorn algorithm for optimal transport
-        cost: [num_Ca, num_vertices]
-        Returns: [num_Ca, num_vertices]
-        """
-        B = torch.exp(-cost / self.sinkhorn_scale)
-        for _ in range(self.sinkhorn_iterations):
-            B = B / B.sum(dim=-1, keepdim=True)  # normalize rows
-            B = B / B.sum(dim=-2, keepdim=True)  # normalize columns
-        return B
-    
-    def _distance(self, X_i, X_j):
-        dX = X_i.unsqueeze(2) - X_j.unsqueeze(1)
-        D = torch.sqrt((dX**2).sum(-1) + self.eps)
-        return D
-    
-    def get_surface_from_obj(self, surface_obj):
-        vertices = []
-        faces = []
-        
-        with open(surface_obj, 'r') as f:
-            for line in f:
-                if line.startswith('v '):
-                    v = list(map(float, line.split()[1:4]))
-                    vertices.append(v)
-                elif line.startswith('f '):
-                    f = [int(v.split('/')[0]) for v in line.split()[1:4]]
-                    faces.append(f)
-        
-        vertices = np.array(vertices)
-        
-        faces = np.array(faces) - 1  # OBJ indices start at 1, so we subtract 1
-        
-        # Calculate the center of mass
-        com = np.mean(vertices, axis=0)
-        print(f"Center of mass before centering: {com}")
-        
-        # Center the vertices
-        vertices_centered = self._center(torch.tensor(vertices, dtype=torch.float32))
-        
-        # Convert to torch tensors
-        device = torch.device('cpu')
-        self.vertices = vertices_centered * self.scale
-        self.faces = torch.tensor(faces, dtype=torch.long, device=device)
-        
-        # Calculate face normals
-        self.face_normals = self.calculate_face_normals()
-        
-        return self.vertices, self.face_normals, self.faces
-    
-    def calculate_face_normals(self):
-        v0 = self.vertices[self.faces[:, 0]]
-        v1 = self.vertices[self.faces[:, 1]]
-        v2 = self.vertices[self.faces[:, 2]]
-        
-        face_normals = torch.cross(v1 - v0, v2 - v0)
-        face_normals = face_normals / face_normals.norm(dim=1, keepdim=True)
-        
-        return face_normals
-    
-    def is_inside_mesh(self, points):
-        # Ray casting algorithm
-        directions = torch.tensor([1.0, 0.0, 0.0], device=points.device).unsqueeze(0).repeat(points.shape[0], 1)
-        
-        intersections = torch.zeros(points.shape[0], dtype=torch.long, device=points.device)
-        
-        for i, face in enumerate(self.faces):
-            v0, v1, v2 = self.vertices[face]
-            n = self.face_normals[i]  # Use face normal
-            
-            # Check if ray intersects with triangle
-            edge1 = v1 - v0
-            edge2 = v2 - v0
-            
-            # Ensure all tensors are 2D for broadcasting
-            edge1 = edge1.unsqueeze(0).expand(points.shape[0], -1)
-            edge2 = edge2.unsqueeze(0).expand(points.shape[0], -1)
-            v0 = v0.unsqueeze(0).expand(points.shape[0], -1)
-            
-            h = torch.cross(directions, edge2, dim=1)
-            a = torch.sum(edge1 * h, dim=1)
-            
-            mask = torch.abs(a) > 1e-6
-            
-            t = points - v0
-            u = torch.sum(t * h, dim=1) / a
-            q = torch.cross(t, edge1, dim=1)
-            v = torch.sum(directions * q, dim=1) / a
-            
-            t = torch.sum(edge2 * q, dim=1) / a
-            
-            intersect_mask = (u >= 0) & (u <= 1) & (v >= 0) & (u + v <= 1) & (t > 0) & mask
-            intersections += intersect_mask.long()
-        
-        return (intersections % 2 == 1).bool()
-    
-    def compute(self, xyz):
-        Ca = xyz[:, 1]  # [L,3]
-        
-        # Center both point clouds
-        Ca = self._center(Ca)
-        vertices = self._center(self.vertices)
-        
-        # Calculate distances between Ca atoms and surface vertices
-        distances = self._distance(Ca, vertices)  # [num_Ca, num_vertices]
-        
-        # Compute optimal transport
-        T_w = self._optimize_sinkhorn(distances)  # [num_Ca, num_vertices]
-        weighted_distances = (T_w * distances).sum(dim=1)  # [num_Ca]
-        
-        # Determine if Ca atoms are inside or outside the mesh
-        is_inside = self.is_inside_mesh(Ca)  # [num_Ca]
-        
-        # Calculate potential
-        potential = torch.zeros_like(weighted_distances)  # [num_Ca]
-        
-        # Apply repulsive potential when distance is more than d_0 and atom is outside the mesh
-        mask = (weighted_distances > self.d_0) & ~is_inside  # [num_Ca]
-        
-        # # Use softplus for smoother gradients
-        # if mask.any():
-        #     potential[mask] = self.weight * (
-        #         (weighted_distances[mask] / (self.d_0 + self.eps)) ** self.r_0 - 1
-        #     )
-        
-        # # Apply attractive potential for atoms outside the mesh
-        # if (~is_inside).any():
-        #     potential[~is_inside] = -self.weight * weighted_distances[~is_inside]
-        
-        # if (~is_inside).any():
-        #     poop = ( weighted_distances[~is_inside] - self.d_0 ) / self.r_0
-        #     potential[~is_inside] = - self.weight * ( 1 - poop**self.n ) / ( 1- poop**self.m)
-        
-        # if (~is_inside).any():
-        potential[is_inside] = - 1e-3 * self.weight * weighted_distances[is_inside]
-        potential[~is_inside] = - self.weight * weighted_distances[~is_inside]
-        
-        if self.unc:
-            potential[mask] = 0.
-        
-        print(f"repulsion ratio: {mask.sum().item() / len(mask):.2f}")
-        print(f"atoms inside mesh: {is_inside.sum().item() / len(is_inside):.2f}")
-        
-        return potential.sum()
-    
-    def _distance(self, X_i, X_j):
-        """
-        Compute pairwise distances between two sets of points
-        X_i: [N, 3]
-        X_j: [M, 3]
-        Returns: [N, M]
-        """
-        dX = X_i.unsqueeze(1) - X_j.unsqueeze(0)  # [N, M, 3]
-        D = torch.sqrt((dX**2).sum(-1) + self.eps)  # [N, M]
-        return D
-
-
-class shape_potential(Potential):
-    def __init__(self, voxel_path, binderlen, threshold=0, step=1, weight=1):
-        self.device="cuda" if torch.cuda.is_available() else "cpu"
-        self.weight = weight
-        
-        voxel_data = self._voxel2tensor(voxel_path, int(step))
-        self.voxel_xyz = voxel_data[:,:3]
-        self.voxel_sdf = voxel_data[:,-1]
-        self.target_xyz = self.voxel_xyz[ self.voxel_sdf<threshold ]
-        print(binderlen)
-        self._map_gw_coupling_ideal_glob(self.target_xyz, binderlen)
-    
-    def _distance(self, X_i, X_j):
-        dX = X_i.unsqueeze(2) - X_j.unsqueeze(1)
-        D = torch.sqrt((dX**2).sum(-1) + 1e-6)
-        return D
-    
-    def _distance_knn(self, X, top_k=12, max_scale=10.0):
-        """Topology distance."""
-        X_np = X.cpu().data.numpy()
-        D = np.sqrt(
-            ((X_np[:, :, np.newaxis, :] - X_np[:, np.newaxis, :, :]) ** 2).sum(-1)
-        )
-        
-        # Distance cutoff
-        D_cutoff = np.mean(np.sort(D[0, :, :], axis=-1)[:, top_k])
-        D[D > D_cutoff] = max_scale * np.max(D)
-        D = shortest_path(D[0, :, :])[np.newaxis, :, :]
-        D = torch.Tensor(D).float().to(X.device)
-        return D
-    
-    def _center(self, _X):
-        _X = _X - _X.mean(1, keepdim=True)
-        return _X
-        
-    def _voxel2tensor(self, voxel_path, step):
+class VoxelGrid:
+    def __init__(self, voxel_path, N_center, resolution, cutoff, shell=True):
+        """Initialize VoxelGrid from JSON file using memory-efficient techniques"""
         with open(voxel_path, "r") as f:
             data = json.load(f)
-            
-        grid_size = data["gridSize"]
-        voxel_size = data["voxelSize"]
-        voxel_origin = data["origin"]
-        sdf_values = data["sdfValues"]
         
-        points_list = []  # Use a NumPy array for efficiency
-        value_index = 0
-        for i in range(0,grid_size,step):
-            for j in range(0,grid_size,step):
-                for k in range(0,grid_size,step):
-                    value_index = (i*grid_size**2)+(j*grid_size)+(k)
-                    sdf_value = sdf_values[value_index]
-                    
-                    x = voxel_origin["x"] + i * voxel_size
-                    y = voxel_origin["y"] + j * voxel_size
-                    z = voxel_origin["z"] + k * voxel_size
-                    
-                    points_list.append([x, y, -z, sdf_value])
-                
-        # Convert the list to a NumPy array and then to a tensor
-        points_array = np.array(points_list, dtype=np.float32)
-        points_tensor = torch.from_numpy(points_array)
+        self.grid_size = data["gridSize"]
+        self.voxel_size = data["voxelSize"]
+        voxel_origin = np.array([
+            data["origin"]["x"],
+            data["origin"]["y"], 
+            data["origin"]["z"],
+        ], dtype=np.float32)
+        self.centered_voxel_origin = voxel_origin - N_center.squeeze() # now, rfdiff and voxel file share the world coord
         
-        return points_tensor
+        self.resolution = resolution
+        self.cutoff = cutoff
+        self.sdf = np.array(data["sdfValues"], dtype=np.float32)
+        
+        self.target_xyzs = self.get_target_xyz_vectorized(shell=shell)
+        prefix = 'shell' if shell else 'core'
+        out_path = voxel_path.replace('.voxel',f'.{prefix}_c{cutoff}.pdb')
+        self._to_pdb(self.target_xyzs, out_path)
     
-    @torch.no_grad()
-    def _map_gw_coupling_ideal_glob(self, X_target, num_residues):
-        """Plan a layout using Gromov-Wasserstein Optimal transport"""
-        
-        X_target = torch.Tensor(X_target).float().unsqueeze(0)
-        X_target = X_target
-        
-        chain_ix = torch.arange(num_residues, device=X_target.device) / 4.0
-        distance_1D = (chain_ix[None, :, None] - chain_ix[None, None, :]).abs()
-        # Scaling fit log-log to large scale single chain 6HYP
-        D_model = 7.21 * distance_1D**0.322
-        D_model = D_model / D_model.mean([1, 2], keepdims=True)
-        
-        D_target = self._distance_knn(X_target)
-        D_target = D_target / D_target.mean([1, 2], keepdims=True)
-        
-        T_gw, D_gw = self._optimize_couplings_gw(
-            D_model,
-            D_target,
-            scale=200,
-            iterations_outer=30,
-            iterations_inner=10,
-        )
-        self.T_gw = T_gw.detach().cpu()
-        
-        return
-    
-    def _optimize_couplings_sinkhorn(self, C, scale=1.0, iterations=10):
-        """Solve entropy regularized optimized transport via Sinkhorn iteration.
-        
-        This method uses the log-domain for numerical stability.
-        
-        Args:
-            C (Tensor): Batch of cost matrices with with shape `(B, I, J)`.
-            scale (float, optional): Entropy regularization parameter for
-                rescaling the cost matrix.
-            iterations (int, optional): Number of Sinkhorn iterations.
-            
-        Returns:
-            T (Tensor): Couplings map with shape `(B, I, J)`.
-        """
-        log_T = -C * scale
-        
-        # Initialize normalizers
-        B, I, J = log_T.shape
-        log_u = torch.zeros((B, I), device=log_T.device)
-        log_v = torch.zeros((B, J), device=log_T.device)
-        log_a = log_u - np.log(I)
-        log_b = log_v - np.log(J)
-        
-        # Iterate normalizers
-        for _ in range(iterations):
-            log_u = log_a - torch.logsumexp(log_T + log_v.unsqueeze(1), 2)
-            log_v = log_b - torch.logsumexp(log_T + log_u.unsqueeze(2), 1)
-        log_T = log_T + log_v.unsqueeze(1) + log_u.unsqueeze(2)
-        T = torch.exp(log_T)
-        return T
-    
-    def _optimize_couplings_gw(self, D_a, D_b, scale=200.0, iterations_outer=30, iterations_inner=10,):
-        """Gromov-Wasserstein Optimal Transport.
-        https://arxiv.org/pdf/1905.07645.pdf
-        
-        Args:
-            D_a (Tensor): Distance matrix describing objects in set `a` with shape `(B, I, I)`.
-            D_b (Tensor): Distance matrix describing objects in set `b` with shape `(B, J, J)`.
-            scale (float, optional): Entropy regularization parameter for
-                rescaling the cost matrix.
-            iterations_outer (int, optional): Number of outer GW iterations.
-            iterations_inner (int, optional): Number of inner Sinkhorn iterations.
-            
-        Returns:
-            T (Tensor): Couplings map with shape `(B, I, J)`.
-            
-        """
-        
-        # Gromov-Wasserstein Distance
-        N_a = D_a.shape[1]
-        N_b = D_b.shape[1]
-        p_a = torch.ones_like(D_a[:, :, 0]) / N_a
-        p_b = torch.ones_like(D_b[:, :, 0]) / N_b
-        C_ab = (
-            torch.einsum("bij,bj->bi", D_a ** 2, p_a)[:, :, None]
-            + torch.einsum("bij,bj->bi", D_b ** 2, p_b)[:, None, :]
-        )
-        T_gw = torch.einsum("bi,bj->bij", p_a, p_b)
-        for _ in range(iterations_outer):
-            cost = C_ab - 2.0 * torch.einsum("bik,bkl,blj->bij", D_a, T_gw, D_b)
-            T_gw = self._optimize_couplings_sinkhorn(cost, scale, iterations=iterations_inner)
-            
-        # Compute cost
-        cost = C_ab - 2.0 * torch.einsum("bik,bkl,blj->bij", D_a, T_gw, D_b)
-        D_gw = (T_gw * cost).sum([-1, -2]).abs().sqrt()
-        return T_gw, D_gw
-    
-    def compute(self, xyz):
-        # Extract C-alpha atom coordinates
-        Ca = xyz[None, :, 1]  # [1,L,3]
-        target_xyz = self.target_xyz[None,...] # [1,N,3]
-        
-        Ca = self._center(Ca)
-        target_xyz = self._center(target_xyz)
-        
-        D_inter = self._distance(Ca, target_xyz)
-        # Compute optimal transport using Sinkhorn's algorithm
-        T_w = self._optimize_couplings_sinkhorn(D_inter)
-        T_w = T_w + self.T_gw
-        T_w = T_w / T_w.sum([-1, -2], keepdims=True)
-        D_w = (T_w * D_inter).sum([-1, -2])
-        out = -self.weight * D_w.sum()
-        print(out)
-        
-        return out 
+    def get_target_xyz_vectorized(self, shell=True):
+        """Vectorized version of get_target_xyz using NumPy."""
 
+        # 1. Create grid indices using the specified resolution
+        indices = np.arange(0, self.grid_size, self.resolution)
+        
+        # Use np.meshgrid to generate index grids
+        X_idx, Y_idx, Z_idx = np.meshgrid(indices, indices, indices, indexing='ij')
+
+        # 2. Calculate the flattened 1D indices for SDF lookup
+        # Ensure indices stay within bounds of self.sdf if grid_size is not perfectly divisible
+        X_idx_flat = X_idx.flatten()
+        Y_idx_flat = Y_idx.flatten()
+        Z_idx_flat = Z_idx.flatten()
+        flat_indices = X_idx_flat + Y_idx_flat * self.grid_size + Z_idx_flat * self.grid_size * self.grid_size
+
+        # Handle potential out-of-bounds due to resolution steps near the edge
+        valid_flat_indices_mask = flat_indices < len(self.sdf)
+        flat_indices = flat_indices[valid_flat_indices_mask]
+        X_idx_flat = X_idx_flat[valid_flat_indices_mask]
+        Y_idx_flat = Y_idx_flat[valid_flat_indices_mask]
+        Z_idx_flat = Z_idx_flat[valid_flat_indices_mask]
+
+
+        # 3. Look up SDF values using the calculated indices
+        sdf_values = self.sdf[flat_indices]
+
+        # 4. Apply filtering conditions using boolean masking
+        upper_bound = self.cutoff + 0.866
+        mask = (sdf_values < upper_bound)
+        if shell:
+            mask &= (sdf_values >= self.cutoff)
+
+        # 5. Select indices that satisfy the conditions
+        filtered_X_idx = X_idx_flat[mask]
+        filtered_Y_idx = Y_idx_flat[mask]
+        filtered_Z_idx = Z_idx_flat[mask]
+
+        # 6. Calculate world coordinates for the filtered indices
+        xxx = self.centered_voxel_origin[0] + filtered_X_idx * self.voxel_size
+        yyy = self.centered_voxel_origin[1] + filtered_Y_idx * self.voxel_size
+        zzz = self.centered_voxel_origin[2] + filtered_Z_idx * self.voxel_size
+
+        # 7. Stack coordinates and convert to PyTorch tensor
+        xyzs_np = np.stack([xxx, yyy, zzz], axis=-1).astype(np.float32)
+        result_tensor = torch.from_numpy(xyzs_np) # More efficient than torch.tensor()
+
+        return result_tensor # [Ns, 3]
+    
+    def is_outside(self, point):
+        """Check if a given point is inside the shell."""
+        point = point.detach().numpy()
+        voxel_index = ((np.array(point) - self.centered_voxel_origin) / self.voxel_size).astype(int)
+        
+        x, y, z = voxel_index
+        if 0 <= x < self.grid_size and 0 <= y < self.grid_size and 0 <= z < self.grid_size:
+            idx = x + y * self.grid_size + z * self.grid_size * self.grid_size
+            sdf_value = self.sdf[idx]
+            
+            return sdf_value > self.cutoff+0.866
+        else:
+            return True
+        
+    def _to_pdb(self, xyz, out_path):
+        with open(out_path, 'w') as f:
+            for idx, (xxx, yyy, zzz) in enumerate(xyz):
+                # Compute voxel indices from coordinate
+                voxel_index = ((np.array([xxx, yyy, zzz]) - self.centered_voxel_origin) / self.voxel_size).astype(int)
+                x_idx, y_idx, z_idx = voxel_index
+                # Compute the flattened index for the voxel grid
+                flat_idx = x_idx + y_idx * self.grid_size + z_idx * (self.grid_size ** 2)
+                sdf_value = self.sdf[flat_idx]
+                f.write(
+                    "%-6s%5s %4s %3s %s%4d    %8.3f%8.3f%8.3f%6.2f%6.2f\n"
+                    % (
+                        "ATOM",
+                        idx,
+                        'Fe',
+                        'X',
+                        'A',
+                        idx,
+                        xxx,
+                        yyy,
+                        zzz,
+                        1.0,
+                        sdf_value,
+                    )
+                )
+        print(out_path)
+                # f.write(f'ATOM      1  CA  ALA A   1    {xxx:8.3f}{yyy:8.3f}{zzz:8.3f}  1.00  0.00           C\n')
+        return
+
+class binder_shell_ncontacts(Potential):
+    def __init__(
+        self,
+        binderlen,
+        weight,
+        voxel_path,
+        target_pdb_path,
+        resolution=1,
+        d_0=6,
+        r_0=8, 
+        cutoff=0,
+    ):
+        target_struct = iu.parse_pdb(target_pdb_path, parse_hetatom=True) # [Lr,14,3]
+        # Zero-center positions
+        N_center = target_struct["xyz"][:, :1, :].mean(axis=0, keepdims=True) # [1,1,3]
+        self.binderlen = binderlen
+        self.weight=weight
+        self.voxel = VoxelGrid(voxel_path=voxel_path, resolution=int(resolution), N_center=N_center, cutoff=cutoff)
+        self.shell = self.voxel.target_xyzs
+        self.r_0 = r_0
+        self.d_0 = d_0
+
+    def compute(self, xyz):
+        # Only look at binder Ca residues
+        Ca = xyz[:self.binderlen,1] # [Lb,3]
+        outside = torch.tensor([self.voxel.is_outside(ca) for ca in Ca], dtype=torch.bool)
+        print(f"Outside: {outside.sum()} / {outside.shape[0]}")
+        # print(Ca.shape, self.shell.shape)
+        dgram = torch.cdist(Ca[None,...].contiguous(), self.shell[None,...].contiguous(), p=2) # [1,Lb,Ns]
+        divide_by_r_0 = (dgram - self.d_0) / self.r_0
+        numerator = torch.pow(divide_by_r_0,6)
+        denominator = torch.pow(divide_by_r_0,12)
+        shell_ncontacts = (1 - numerator) / (1 - denominator)
+        #Potential is the sum of values in the tensor
+        shell_ncontacts = shell_ncontacts.sum()
+        
+        print("SHELL CONTACTS:", shell_ncontacts.sum())
+        
+        return self.weight * shell_ncontacts
+
+class binder_core_ncontacts(Potential):
+    def __init__(
+        self,
+        binderlen,
+        weight,
+        voxel_path,
+        target_pdb_path,
+        resolution=1,
+        d_0=6,
+        r_0=8, 
+        cutoff=0,
+    ):
+        target_struct = iu.parse_pdb(target_pdb_path, parse_hetatom=True) # [Lr,14,3]
+        # Zero-center positions
+        N_center = target_struct["xyz"][:, :1, :].mean(axis=0, keepdims=True) # [1,1,3]
+        self.binderlen = binderlen
+        self.weight=weight
+        self.voxel = VoxelGrid(voxel_path=voxel_path, resolution=int(resolution), N_center=N_center, cutoff=cutoff, shell=False)
+        self.core = self.voxel.target_xyzs
+        self.r_0 = r_0
+        self.d_0 = d_0
+
+    def compute(self, xyz):
+        # Only look at binder Ca residues
+        Ca = xyz[:self.binderlen,1] # [Lb,3]
+        outside = torch.tensor([self.voxel.is_outside(ca) for ca in Ca], dtype=torch.bool)
+        print(f"Outside: {outside.sum()} / {outside.shape[0]}")
+        # print(Ca.shape, self.shell.shape)
+        dgram = torch.cdist(Ca[None,...].contiguous(), self.core[None,...].contiguous(), p=2) # [1,Lb,Ns]
+        divide_by_r_0 = (dgram - self.d_0) / self.r_0
+        numerator = torch.pow(divide_by_r_0,6)
+        denominator = torch.pow(divide_by_r_0,12)
+        core_ncontacts = (1 - numerator) / (1 - denominator)
+        #Potential is the sum of values in the tensor
+        core_ncontacts = core_ncontacts.sum()
+        
+        print("CORE CONTACTS:", core_ncontacts.sum())
+        
+        return self.weight * core_ncontacts
+
+# class binder_shape(Potential):
+#     def __init__(
+#         self,
+#         binderlen,
+#         weight,
+#         target_X,
+#     ):
+#         target_X = VoxelGrid(target_X, step=1, threshold=0).target_X
+#         if torch.is_tensor(target_X):
+#             target_X = target_X.cpu().data.numpy()
+            
+#         self.binderlen = int(binderlen)
+#         self.weight = weight
+#         self._map_gw_coupling_ideal_glob(target_X, binderlen)
+        
+#         target_X = torch.Tensor(target_X)
+#         self.target_X = target_X[None, ...].clone().detach()
+    
+#     def optimize_couplings_sinkhorn(self, C, scale=1.0, iterations=10):
+#         log_T = -C * scale
+
+#         # Initialize normalizers
+#         B, I, J = log_T.shape
+#         log_u = torch.zeros((B, I), device=log_T.device)
+#         log_v = torch.zeros((B, J), device=log_T.device)
+#         log_a = log_u - np.log(I)
+#         log_b = log_v - np.log(J)
+
+#         # Iterate normalizers
+#         for j in range(iterations):
+#             log_u = log_a - torch.logsumexp(log_T + log_v.unsqueeze(1), 2)
+#             log_v = log_b - torch.logsumexp(log_T + log_u.unsqueeze(2), 1)
+#         log_T = log_T + log_v.unsqueeze(1) + log_u.unsqueeze(2)
+#         T = torch.exp(log_T)
+#         return T
+    
+#     def optimize_couplings_gw(
+#         self, D_a, D_b, scale=200.0, iterations_outer=30,
+#     ):
+#         # Gromov-Wasserstein Distance
+#         N_a = D_a.shape[1]
+#         N_b = D_b.shape[1]
+#         p_a = torch.ones_like(D_a[:, :, 0]) / N_a
+#         p_b = torch.ones_like(D_b[:, :, 0]) / N_b
+#         C_ab = (
+#             torch.einsum("bij,bj->bi", D_a ** 2, p_a)[:, :, None]
+#             + torch.einsum("bij,bj->bi", D_b ** 2, p_b)[:, None, :]
+#         )
+#         T_gw = torch.einsum("bi,bj->bij", p_a, p_b)
+#         for i in range(iterations_outer):
+#             cost = C_ab - 2.0 * torch.einsum("bik,bkl,blj->bij", D_a, T_gw, D_b)
+#             T_gw = self.optimize_couplings_sinkhorn(cost, scale)
+
+#         # Compute cost
+#         cost = C_ab - 2.0 * torch.einsum("bik,bkl,blj->bij", D_a, T_gw, D_b)
+#         D_gw = (T_gw * cost).sum([-1, -2]).abs().sqrt()
+#         return T_gw, D_gw
+    
+#     def _map_gw_coupling_ideal_glob(self, target_X, binderlen):
+#         target_X = torch.Tensor(target_X).float().unsqueeze(0).to('cuda')
+        
+#         # chain_ix = torch.arange(4 * binderlen, device='cuda') / 4.0
+#         chain_ix = torch.arange(binderlen, device='cuda')
+#         distance_1D = (chain_ix[None, :, None] - chain_ix[None, None, :]).abs()
+#         D_model = 7.21 * distance_1D**0.322
+#         D_model = D_model / D_model.mean([1, 2], keepdim=True)
+        
+#         D_target = self._distance_knn(target_X)
+#         D_target = D_target / D_target.mean([1, 2], keepdim=True)
+        
+#         print(f"D_model.shape={D_model.shape}, D_target.shape={D_target.shape}")
+        
+#         T_gw, D_gw = self.optimize_couplings_gw(D_model, D_target)
+#         self.T_gw = T_gw.clone().detach().cpu()
+#         return
+    
+#     def _distance_knn(self, X):
+#         X_np = X.cpu().data.numpy()
+#         D = np.sqrt(
+#             ((X_np[:, :, np.newaxis, :] - X_np[:, np.newaxis, :, :]) ** 2).sum(-1)
+#         )
+
+#         # Distance cutoff
+#         D_cutoff = np.mean(np.sort(D[0, :, :], axis=-1)[:, 12])
+#         D[D > D_cutoff] = 10.0 * np.max(D)
+#         D = shortest_path(D[0, :, :])[np.newaxis, :, :]
+#         D = torch.Tensor(D).float().to(X.device)
+#         return D
+    
+#     def _distance(self, X_i, X_j):
+#         # print(f"X_i.shape={X_i.shape}, X_j.shape={X_j.shape}")
+#         dX = X_i.unsqueeze(2) - X_j.unsqueeze(1)
+#         D = torch.sqrt((dX**2).sum(-1) + 1e-6)
+#         return D
+    
+    
+#     def compute(self, xyz):
+#         target_X = self.target_X
+#         binderlen = self.binderlen
+#         binder_X = xyz[None, :binderlen, 1] # Ca
+#         # print(f'target_X.shape={target_X.shape}, binder_X.shape={binder_X.shape}')
+#         # print(f'target_X.device={target_X.device}, binder_X.shape={binder_X.device}')
+        
+#         min_rg = 2.0 * binderlen**0.333
+#         max_rg = 1.5 * 2.0 * binderlen**0.4
+        
+#         def _center(_X):
+#             _X = _X - _X.mean(1, keepdim=True)
+#             return _X
+        
+#         def _rg(_X):
+#             _X = _center(_X)
+#             rsq = _X.square().sum(2, keepdim=True)
+#             rg = rsq.mean(1, keepdim=True).sqrt()
+#             return rg
+        
+#         # will disabling this move the centroid correctly
+#         target_X = _center(target_X)
+#         binder_X = _center(binder_X)
+        
+#         D_inter = self._distance(target_X, binder_X)
+        
+#         T_w = self.optimize_couplings_sinkhorn(D_inter)
+#         # print(f'T_w.shape={T_w.shape}, T_gw.shape={self.T_gw.shape}')
+#         # print(f'T_w.device={T_w.device}, T_gw.shape={self.T_gw.device}')
+#         T_w = T_w + self.T_gw.permute(0,2,1) * 0.4
+#         T_w = T_w / T_w.sum([-1, -2], keepdims=True)
+#         D_w = (T_w * D_inter).sum([-1, -2])
+        
+#         print(f"GW distance={D_w}")
+#         return - self.weight * D_w
+
+# class monomer_shape(Potential):
+#     def __init__(
+#         self,
+#         monomerlen,
+#         weight,
+#         target_X,
+#         step: int
+#     ):
+#         target_X = VoxelGrid(target_X, step=int(step), threshold=0).target_X
+#         if torch.is_tensor(target_X):
+#             target_X = target_X.cpu().data.numpy()
+            
+#         self.monomerlen = int(monomerlen)
+#         self.weight = weight
+#         self._map_gw_coupling_ideal_glob(target_X, self.monomerlen)
+        
+#         target_X = torch.Tensor(target_X)
+#         self.target_X = target_X[None, ...].clone().detach()
+#         print(self.target_X.shape)
+    
+#     def optimize_couplings_sinkhorn(self, C, scale=1.0, iterations=10):
+#         log_T = -C * scale
+
+#         # Initialize normalizers
+#         B, I, J = log_T.shape
+#         log_u = torch.zeros((B, I), device=log_T.device)
+#         log_v = torch.zeros((B, J), device=log_T.device)
+#         log_a = log_u - np.log(I)
+#         log_b = log_v - np.log(J)
+
+#         # Iterate normalizers
+#         for j in range(iterations):
+#             log_u = log_a - torch.logsumexp(log_T + log_v.unsqueeze(1), 2)
+#             log_v = log_b - torch.logsumexp(log_T + log_u.unsqueeze(2), 1)
+#         log_T = log_T + log_v.unsqueeze(1) + log_u.unsqueeze(2)
+#         T = torch.exp(log_T)
+#         return T
+    
+#     def optimize_couplings_gw(
+#         self, D_a, D_b, scale=200.0, iterations_outer=30,
+#     ):
+#         # Gromov-Wasserstein Distance
+#         N_a = D_a.shape[1]
+#         N_b = D_b.shape[1]
+#         p_a = torch.ones_like(D_a[:, :, 0]) / N_a
+#         p_b = torch.ones_like(D_b[:, :, 0]) / N_b
+#         C_ab = (
+#             torch.einsum("bij,bj->bi", D_a ** 2, p_a)[:, :, None]
+#             + torch.einsum("bij,bj->bi", D_b ** 2, p_b)[:, None, :]
+#         )
+#         T_gw = torch.einsum("bi,bj->bij", p_a, p_b)
+#         for i in range(iterations_outer):
+#             cost = C_ab - 2.0 * torch.einsum("bik,bkl,blj->bij", D_a, T_gw, D_b)
+#             T_gw = self.optimize_couplings_sinkhorn(cost, scale)
+
+#         # Compute cost
+#         cost = C_ab - 2.0 * torch.einsum("bik,bkl,blj->bij", D_a, T_gw, D_b)
+#         D_gw = (T_gw * cost).sum([-1, -2]).abs().sqrt()
+#         return T_gw, D_gw
+    
+#     def _map_gw_coupling_ideal_glob(self, target_X, monomerlen):
+#         target_X = torch.Tensor(target_X).float().unsqueeze(0).to('cuda')
+        
+#         # chain_ix = torch.arange(4 * monomerlen, device='cuda') / 4.0
+#         chain_ix = torch.arange(monomerlen, device='cuda')
+#         distance_1D = (chain_ix[None, :, None] - chain_ix[None, None, :]).abs()
+#         D_model = 7.21 * distance_1D**0.322
+#         D_model = D_model / D_model.mean([1, 2], keepdim=True)
+        
+#         D_target = self._distance_knn(target_X)
+#         D_target = D_target / D_target.mean([1, 2], keepdim=True)
+        
+#         print(f"D_model.shape={D_model.shape}, D_target.shape={D_target.shape}")
+        
+#         T_gw, D_gw = self.optimize_couplings_gw(D_model, D_target)
+#         self.T_gw = T_gw.clone().detach().cpu()
+#         return
+    
+#     def _distance_knn(self, X):
+#         X_np = X.cpu().data.numpy()
+#         D = np.sqrt(
+#             ((X_np[:, :, np.newaxis, :] - X_np[:, np.newaxis, :, :]) ** 2).sum(-1)
+#         )
+
+#         # Distance cutoff
+#         D_cutoff = np.mean(np.sort(D[0, :, :], axis=-1)[:, 12])
+#         D[D > D_cutoff] = 10.0 * np.max(D)
+#         D = shortest_path(D[0, :, :])[np.newaxis, :, :]
+#         D = torch.Tensor(D).float().to(X.device)
+#         return D
+    
+#     def _distance(self, X_i, X_j):
+#         # print(f"X_i.shape={X_i.shape}, X_j.shape={X_j.shape}")
+#         dX = X_i.unsqueeze(2) - X_j.unsqueeze(1)
+#         D = torch.sqrt((dX**2).sum(-1) + 1e-6)
+#         return D
+    
+    
+#     def compute(self, xyz):
+#         target_X = self.target_X
+#         monomerlen = self.monomerlen
+#         monomer_X = xyz[None,:,1] # Ca
+        
+#         def _center(_X):
+#             _X = _X - _X.mean(1, keepdim=True)
+#             return _X
+        
+#         target_X = _center(target_X)
+#         monomer_X = _center(monomer_X)
+        
+#         D_inter = self._distance(target_X, monomer_X)
+        
+#         T_w = self.optimize_couplings_sinkhorn(D_inter)
+#         T_w = T_w + self.T_gw.permute(0,2,1) * 0.4
+#         T_w = T_w / T_w.sum([-1, -2], keepdims=True)
+#         D_w = (T_w * D_inter).sum([-1, -2])
+        
+#         print(f"GW distance={D_w}")
+#         return - self.weight * D_w
 
 # Dictionary of types of potentials indexed by name of potential. Used by PotentialManager.
 # If you implement a new potential you must add it to this dictionary for it to be used by
@@ -843,9 +919,12 @@ implemented_potentials = { 'monomer_ROG':          monomer_ROG,
                            'interface_ncontacts':  interface_ncontacts,
                            'monomer_contacts':     monomer_contacts,
                            'olig_contacts':        olig_contacts,
-                           'substrate_contacts':    substrate_contacts,
-                           'updated_custom_obj_repulsive': updated_custom_obj_repulsive,
-                           'shape_potential':      shape_potential,
+                           'substrate_contacts':   substrate_contacts,
+                        #    'binder_shell':   binder_shell,
+                           'binder_shell_ncontacts': binder_shell_ncontacts,
+                           'binder_core_ncontacts': binder_core_ncontacts,
+                        #    'binder_shape':   binder_shape,
+                        #    'monomer_shape':   monomer_shape,
                            }
 
 require_binderlen      = { 'binder_ROG',
@@ -854,6 +933,8 @@ require_binderlen      = { 'binder_ROG',
                            'dimer_ROG',
                            'binder_ncontacts',
                            'interface_ncontacts',
-                           'shape_potential',
+                        #    'binder_shape',
+                        #    'binder_shell',
+                           'binder_shell_ncontacts',
+                           'binder_core_ncontacts',
                            }
-
